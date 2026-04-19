@@ -2,11 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-from anomaly_detector import get_detector, current_app
 import hashlib
 import os
-
-detector = None
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-in-production'
@@ -28,13 +25,6 @@ CORS(app, origins=['http://localhost:3000', 'http://127.0.0.1:3000'], supports_c
 
 # ========== Token 管理 ==========
 user_sessions = {}
-
-
-def init_detector(app):
-    """初始化异常检测器"""
-    global detector
-    detector = get_detector(app)
-    return detector
 
 
 def generate_token(username):
@@ -242,12 +232,103 @@ class NotificationSetting(db.Model):
         }
 
 
-# ========== 导入异常检测和LLM分析模块 ==========
-from anomaly_detector import AnomalyDetector
+# ========== 导入LLM分析模块 ==========
 from llm_analyzer import llm_analyzer
 
-# 创建异常检测器实例
-detector = AnomalyDetector(contamination=0.05)
+
+# ========== 简单阈值异常检测函数 ==========
+
+def check_metric_threshold(service_key, metric_name, current_value):
+    """检查指标是否超过阈值"""
+    thresholds = {
+        'cpu_usage': {'warning': 70, 'critical': 85},
+        'memory_usage': {'warning': 75, 'critical': 90},
+        'request_latency': {'warning': 200, 'critical': 500},
+        'error_rate': {'warning': 2, 'critical': 5}
+    }
+
+    if metric_name not in thresholds:
+        return None
+
+    th = thresholds[metric_name]
+    if current_value >= th['critical']:
+        return 'critical'
+    elif current_value >= th['warning']:
+        return 'warning'
+    return None
+
+
+def run_simple_anomaly_detection(service_key=None):
+    """运行简单的阈值异常检测"""
+    if service_key:
+        services = Service.query.filter_by(service_key=service_key).all()
+    else:
+        services = Service.query.all()
+
+    metrics_config = ['cpu_usage', 'memory_usage', 'request_latency', 'error_rate']
+    all_alerts = []
+
+    for service in services:
+        for metric_name in metrics_config:
+            # 获取最新的一条指标数据
+            latest_metric = Metric.query.filter(
+                Metric.service_key == service.service_key,
+                Metric.metric_name == metric_name
+            ).order_by(Metric.timestamp.desc()).first()
+
+            if not latest_metric:
+                continue
+
+            current_value = float(latest_metric.metric_value)
+            severity = check_metric_threshold(service.service_key, metric_name, current_value)
+
+            if severity:
+                # 计算异常分数
+                if severity == 'critical':
+                    anomaly_score = 0.85 + (current_value / 1000) * 0.1
+                else:
+                    anomaly_score = 0.55 + (current_value / 1000) * 0.1
+                anomaly_score = min(0.99, anomaly_score)
+
+                # 检查是否已有相同告警（避免重复）
+                existing_alert = Alert.query.filter(
+                    Alert.service_key == service.service_key,
+                    Alert.metric_name == metric_name,
+                    Alert.status == 'pending',
+                    Alert.created_at >= datetime.utcnow() - timedelta(minutes=30)
+                ).first()
+
+                if existing_alert:
+                    continue
+
+                # 创建告警
+                description = f'{service.service_name} {metric_name} 超过阈值，当前值: {current_value}'
+                if metric_name == 'cpu_usage':
+                    description = f'CPU使用率达到 {current_value}%，超过{"严重" if severity == "critical" else "警告"}阈值'
+                elif metric_name == 'memory_usage':
+                    description = f'内存使用率达到 {current_value}%，超过{"严重" if severity == "critical" else "警告"}阈值'
+                elif metric_name == 'request_latency':
+                    description = f'请求延迟 {current_value}ms，超过{"严重" if severity == "critical" else "警告"}阈值'
+                elif metric_name == 'error_rate':
+                    description = f'错误率达到 {current_value}%，超过{"严重" if severity == "critical" else "警告"}阈值'
+
+                alert = Alert(
+                    service_key=service.service_key,
+                    metric_name=metric_name,
+                    metric_value=current_value,
+                    anomaly_score=anomaly_score,
+                    severity=severity,
+                    title=f'{service.service_name} {metric_name} 异常',
+                    description=description,
+                    status='pending'
+                )
+                db.session.add(alert)
+                all_alerts.append(alert)
+
+    if all_alerts:
+        db.session.commit()
+
+    return all_alerts
 
 
 # ========== 用户相关接口 ==========
@@ -322,7 +403,6 @@ def update_user_profile():
         avatar_data = data['avatar']
         if avatar_data and avatar_data.startswith('data:image'):
             import base64
-            from werkzeug.utils import secure_filename
 
             img_data = avatar_data.split(',')[1]
             img_bytes = base64.b64decode(img_data)
@@ -423,17 +503,14 @@ def health_check():
 
 @app.route('/api/dashboard/overview', methods=['GET'])
 def get_dashboard_overview():
-    # 服务统计
     total_services = Service.query.count()
     healthy_services = Service.query.filter_by(status='healthy').count()
     warning_services = Service.query.filter_by(status='warning').count()
     critical_services = Service.query.filter_by(status='critical').count()
 
-    # 告警统计
     pending_alerts = Alert.query.filter_by(status='pending').count()
     confirmed_alerts = Alert.query.filter_by(status='confirmed').count()
 
-    # 服务健康列表
     services = Service.query.all()
     service_health = []
     for s in services:
@@ -453,10 +530,8 @@ def get_dashboard_overview():
             'latency': float(latency_metric.metric_value) if latency_metric else 0
         })
 
-    # 最近告警
     recent_alerts = Alert.query.order_by(Alert.created_at.desc()).limit(5).all()
 
-    # 告警趋势
     alert_trends = []
     for i in range(7):
         date = datetime.now() - timedelta(days=6 - i)
@@ -522,7 +597,6 @@ def get_alert_detail(alert_id):
 
     result = alert.to_dict()
 
-    # 获取相关日志
     logs = AppLog.query.filter(
         AppLog.service_key == alert.service_key,
         AppLog.timestamp >= alert.created_at - timedelta(minutes=30),
@@ -530,7 +604,6 @@ def get_alert_detail(alert_id):
     ).limit(20).all()
     result['related_logs'] = [log.to_dict() for log in logs]
 
-    # 获取影响的服务
     affected = ServiceDependency.query.filter(
         (ServiceDependency.source_service == alert.service_key) |
         (ServiceDependency.target_service == alert.service_key)
@@ -541,7 +614,6 @@ def get_alert_detail(alert_id):
         affected_services.add(d.target_service)
     result['affected_services'] = list(affected_services)
 
-    # 获取指标历史
     metrics = Metric.query.filter(
         Metric.service_key == alert.service_key,
         Metric.metric_name == alert.metric_name,
@@ -587,58 +659,43 @@ def get_topology():
 
 @app.route('/api/detect/anomaly', methods=['POST'])
 def detect_anomaly():
-    """执行异常检测"""
+    """执行简单阈值异常检测"""
     try:
-        data = request.json or {}
-        service_key = data.get('service_key')
+        data = request.get_json() or {}
+        service_key = data.get('service_name')  # 前端传的是 service_name
 
-        # 使用全局检测器
-        global detector
-        if detector is None:
-            detector = init_detector(current_app._get_current_object())
-
-        # 执行检测
-        alerts = detector.detect_and_save(service_key=service_key)
+        # 运行简单阈值检测
+        alerts = run_simple_anomaly_detection(service_key=service_key)
 
         return jsonify({
             'success': True,
-            'message': f'检测完成，发现 {len(alerts)} 个异常',
-            'alerts_count': len(alerts),
-            'alerts': [
-                {
-                    'id': alert.id,
-                    'service_name': alert.service_name,
-                    'metric_name': alert.metric_name,
-                    'severity': alert.severity,
-                    'description': alert.description
-                }
-                for alert in alerts
-            ]
+            'alerts_generated': len(alerts),
+            'alerts': [a.to_dict() for a in alerts]
         })
-
     except Exception as e:
-        import traceback
         print(f"Anomaly detection error: {e}")
+        import traceback
         traceback.print_exc()
         return jsonify({
             'success': False,
+            'alerts_generated': 0,
+            'alerts': [],
             'error': str(e)
         }), 500
 
 
 @app.route('/api/analyze/logs', methods=['POST'])
 def analyze_logs():
-    """分析日志并生成诊断 - 使用真实的 LLM 分析器"""
+    """分析日志并生成诊断"""
     print("[INFO] 执行日志智能分析...")
     data = request.get_json() or {}
     service_name = data.get('service_name')
     alert_id = data.get('alert_id')
 
-    # 使用 LLM 分析器从数据库获取日志并分析
     diagnosis, logs = llm_analyzer.analyze_from_db(
         service_key=service_name,
         alert_id=alert_id,
-        minutes=300
+        minutes=30
     )
 
     return jsonify({
@@ -669,6 +726,5 @@ def get_service_metrics(service_key):
 
 
 if __name__ == '__main__':
-    # 创建静态文件目录
     os.makedirs('static/avatars', exist_ok=True)
     app.run(debug=True, port=5000)
